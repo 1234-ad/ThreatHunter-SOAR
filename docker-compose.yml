@@ -1,0 +1,298 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:13
+    container_name: threathunter-postgres
+    environment:
+      POSTGRES_DB: threathunter_soar
+      POSTGRES_USER: soar_user
+      POSTGRES_PASSWORD: secure_password_123
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:6-alpine
+    container_name: threathunter-redis
+    command: redis-server --appendonly yes --requirepass redis_password_123
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: threathunter-backend
+    environment:
+      - DATABASE_URL=postgresql://soar_user:secure_password_123@postgres:5432/threathunter_soar
+      - REDIS_URL=redis://:redis_password_123@redis:6379/0
+      - SECRET_KEY=your-secret-key-here-change-in-production
+      - DEBUG=false
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:3001
+    volumes:
+      - ./backend:/app
+      - ./rules:/app/rules
+      - ./ml_pipeline:/app/ml_pipeline
+      - threat_data:/app/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - soar-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend React App
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: threathunter-frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_WS_URL=ws://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: threathunter-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+  # Elasticsearch for log storage
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.0
+    container_name: threathunter-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=false
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+  # Kibana for log visualization
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.17.0
+    container_name: threathunter-kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+  # Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: threathunter-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+  # Grafana for dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: threathunter-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+  # ML Training Service
+  ml-trainer:
+    build:
+      context: ./ml_pipeline
+      dockerfile: Dockerfile
+    container_name: threathunter-ml-trainer
+    environment:
+      - DATABASE_URL=postgresql://soar_user:secure_password_123@postgres:5432/threathunter_soar
+      - REDIS_URL=redis://:redis_password_123@redis:6379/1
+    volumes:
+      - ./ml_pipeline:/app
+      - ml_models:/app/models
+      - threat_data:/app/data
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - soar-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  # Threat Intelligence Collector
+  threat-intel:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.intel
+    container_name: threathunter-intel
+    environment:
+      - DATABASE_URL=postgresql://soar_user:secure_password_123@postgres:5432/threathunter_soar
+      - REDIS_URL=redis://:redis_password_123@redis:6379/2
+      - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY}
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY}
+      - OTX_API_KEY=${OTX_API_KEY}
+    volumes:
+      - ./backend:/app
+      - threat_intel_data:/app/intel_data
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+  # Log Shipper (Filebeat)
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:7.17.0
+    container_name: threathunter-filebeat
+    user: root
+    volumes:
+      - ./monitoring/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/log:/var/log:ro
+    environment:
+      - ELASTICSEARCH_HOST=elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+  # YARA Rule Engine
+  yara-engine:
+    build:
+      context: ./rules
+      dockerfile: Dockerfile.yara
+    container_name: threathunter-yara
+    volumes:
+      - ./rules/yara:/app/rules
+      - threat_samples:/app/samples
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+  # Notification Service
+  notification-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.notifications
+    container_name: threathunter-notifications
+    environment:
+      - REDIS_URL=redis://:redis_password_123@redis:6379/3
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - TEAMS_WEBHOOK_URL=${TEAMS_WEBHOOK_URL}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - redis
+    networks:
+      - soar-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  ml_models:
+    driver: local
+  threat_data:
+    driver: local
+  threat_intel_data:
+    driver: local
+  threat_samples:
+    driver: local
+
+networks:
+  soar-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
